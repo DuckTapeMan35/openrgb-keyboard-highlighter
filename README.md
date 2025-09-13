@@ -23,7 +23,7 @@ Support for highlighting keys when held according to a configuration file with p
 ```bash
 sudo python -m venv /root/openrgb_keyboard_highlighter_venv
 sudo /root/openrgb_keyboard_highlighter_venv/bin/pip install --upgrade pip
-sudo /root/openrgb_keyboard_highlighter_venv/bin/pip install keyboard openrgb-python watchdog yaml i3ipc
+sudo /root/openrgb_keyboard_highlighter_venv/bin/pip install keyboard openrgb-python watchdog pyyaml i3ipc
 ```
 
 ## Setup
