@@ -14,16 +14,19 @@ CONFIG_NAME="config.yaml"
 echo "Creating config directory: $CONFIG_DIR"
 mkdir -p "$CONFIG_DIR"
 
-# Copy scripts to config directory
-echo "Copying script and config file to config directory..."
+# Create logs directory
+mkdir -p "$CONFIG_DIR/logs"
+
+# Copy script with proper permissions
+echo "Copying script to /usr/bin..."
 sudo cp "$OPENRGB_HIGHLIGHTER" "/usr/bin/"
-chmod +x "/usr/bin/$OPENRGB_HIGHLIGHTER"
+sudo chmod +x "/usr/bin/$OPENRGB_HIGHLIGHTER"
 
 # Install Python dependencies
 echo "Installing Root Python packages..."
 sudo python -m venv /root/openrgb_keyboard_highlighter_venv
 sudo /root/openrgb_keyboard_highlighter_venv/bin/pip install --upgrade pip
-sudo /root/openrgb_keyboard_highlighter_venv/bin/pip install keyboard openrgb-python watchdog yaml i3ipc
+sudo /root/openrgb_keyboard_highlighter_venv/bin/pip install keyboard openrgb-python watchdog pyyaml i3ipc
 
 # Create default config file if needed
 if [ ! -f "$CONFIG_DIR/config.yaml" ]; then
@@ -44,7 +47,7 @@ echo "Creating systemd service..."
 # Use current DISPLAY and XAUTHORITY values
 CURRENT_DISPLAY=${DISPLAY:-":0"}
 
-cat << EOL | sudo tee "/etc/systemd/system/keyboard-listener.service" > /dev/null
+cat << EOL | sudo tee "/etc/systemd/system/openrgb_highlighter.service" > /dev/null
 [Unit]
 Description=Keyboard Highlighter Service
 After=graphical.target display-manager.service
@@ -64,8 +67,8 @@ EOL
 # Start the service
 echo "Starting service..."
 sudo systemctl daemon-reload
-sudo systemctl enable "$SERVICE_NAME"
-sudo systemctl start "$SERVICE_NAME"
+sudo systemctl enable openrgb_highlighter.service
+sudo systemctl start openrgb_highlighter.service
 
 echo "Installation complete!"
 echo "The keyboard Listener service is now running."
@@ -73,8 +76,8 @@ echo ""
 echo "Important: Log out and back in to apply group changes"
 echo ""
 echo "Service control:"
-echo "  sudo systemctl status $SERVICE_NAME"
-echo "  sudo systemctl restart $SERVICE_NAME"
+echo "  sudo systemctl status openrgb_highlighter.service"
+echo "  sudo systemctl restart openrgb_highlighter.service"
 echo ""
 echo "View logs: tail -f $CONFIG_DIR/logs.txt"
 echo "Edit config: $CONFIG_DIR/config.yaml"
