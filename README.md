@@ -35,8 +35,6 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-You need yay or paru for this setup script to work.
-
 This will create a daemon for root that runs the highlighter. There is a 5 second delay on startup to ensure the openrgb server is running correctly so it's normal if the lighting effect takes a bit on startup, I couldn't get this delay to be smaller reliably.
 
 If you don't want to run this as a daemon (as it is intended) it must be run as root and with the environment variable `OPENRGB_USER` set as your user.
