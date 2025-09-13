@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/root/openrgb_keyboard_highlighter_venv/bin/python
 import logging
 from openrgb import OpenRGBClient
 from openrgb.utils import RGBColor, DeviceType
@@ -16,11 +16,9 @@ from watchdog.events import FileSystemEventHandler
 import subprocess
 import select
 import socket
-import struct
-import hmac
-import binascii
 import sys
-import hashlib
+import keyboard
+import pwd
 
 # Conditionally import i3ipc only if needed
 try:
@@ -38,11 +36,33 @@ class MemoryEfficientFormatter(logging.Formatter):
         else:
             # More detailed format for warnings and errors
             return f"{record.name} - {record.levelname} - {record.getMessage()}"
-            
+
+# Get the correct user home directory
+def get_user_home():
+    """Get the home directory of the logged-in user, even when running as root."""
+    try:
+        # Try to get the user from environment variables (works with sudo)
+        username = os.environ.get('OPENRGB_USER')
+        if not username:
+            # Try other common environment variables
+            username = os.environ.get('LOGNAME') or os.environ.get('USER')
+        
+        # If we found a username and it's not root, get their home directory
+        if username and username != 'root':
+            return pwd.getpwnam(username).pw_dir
+        
+        # Final fallback: Use current user's home
+        return os.path.expanduser('~')
+    except Exception as e:
+        logging.error(f"Error determining user home: {e}")
+        return os.path.expanduser('~')  # Fallback
+
 # Update your setup_logger function
 def setup_logger(level=logging.INFO):
+    # Get the correct user home directory
+    user_home = get_user_home()
     # Create log directory if it doesn't exist
-    log_dir = os.path.expanduser('~/.config/openrgb-keyboard-highlighter')
+    log_dir = os.path.join(user_home, '.config', 'openrgb-keyboard-highlighter')
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, 'logs.txt')
     
@@ -97,10 +117,9 @@ class KeyboardController:
         'key_positions', 'wm_type', 'pressed_keys', 'colors_lock',
         'colors', 'key_listener', 'wm_thread', 'pywal_updated',
         'config_updated', 'pywal_watchdog_observer', 'config_watchdog_observer',
-        'current_mode', 'modifier_keys', 'pipe_fd', 'wm_integration_enabled',
-        'wm_lock', 'current_key_states', 'need_redraw', 'last_non_empty_workspaces',
-        'pipe_thread', 'redraw_count', 'skip_count', '_string_cache', 'previous_mode',
-        'key_name_to_position'  # Added for key name to position mapping
+        'current_mode', 'modifier_keys', 'current_key_states', 'need_redraw', 'last_non_empty_workspaces',
+        'redraw_count', 'skip_count', '_string_cache', 'previous_mode',
+        'key_name_to_position', 'keyboard_hook', 'wm_integration_enabled', 'wm_lock', 'user_home'
     ]
 
     def __init__(self):
@@ -108,16 +127,12 @@ class KeyboardController:
             # Initialize with error handling
             logger.info("Initializing keyboard controller...")
             
+            # Get the correct user home directory
+            self.user_home = get_user_home()
+            logger.info(f"Using user home directory: {self.user_home}")
+            
             # Load configuration first
             self.config = self.load_config()
-
-            # Start openrgb server
-            self.start_rgb_server()
-
-            # Wait for the server to fully initialize
-            time.sleep(5)
-
-            self._string_cache = {}
             
             # Set log level based on config
             log_level = self.config.get('log_level', 'INFO').upper()
@@ -129,6 +144,13 @@ class KeyboardController:
             logger.setLevel(numeric_level)
             
             logger.info(f"Log level set to: {log_level}")
+            
+            # Start openrgb server
+            self.start_rgb_server()
+
+            time.sleep(5)
+
+            self._string_cache = {}
             
             # Initialize OpenRGB client
             self.client = OpenRGBClient()
@@ -180,9 +202,6 @@ class KeyboardController:
                 'ctrl': ['ctrl', 'control']
             }
             
-            # Use FD passing instead of named pipes
-            self.pipe_fd = None
-            
             # Check if workspace integration is needed
             self.wm_integration_enabled = self.config.get('workspaces', False) or self.needs_wm_integration()
             logger.info(f"Workspace integration: {'ENABLED' if self.wm_integration_enabled else 'DISABLED'}")
@@ -204,6 +223,9 @@ class KeyboardController:
             self.need_redraw = False
             self.last_non_empty_workspaces = set()
             
+            # Set up keyboard hook
+            self.keyboard_hook = None
+            
             logger.info("Keyboard controller initialized successfully")
             
         except Exception as e:
@@ -212,7 +234,7 @@ class KeyboardController:
             raise
 
     def start_rgb_server(self):
-        logger.info("Starting oppenrgb server")
+        logger.info("Starting openrgb server")
 
         openrgb_executable_path = "/usr/bin/openrgb"
         
@@ -302,8 +324,8 @@ class KeyboardController:
         """Load YAML configuration from script directory"""
         try:
             # Get config file
-            script_dir = os.path.expanduser('~/.config/openrgb-keyboard-highlighter')
-            config_path = os.path.join(script_dir, 'config.yaml')
+            config_dir = os.path.join(self.user_home, '.config', 'openrgb-keyboard-highlighter')
+            config_path = os.path.join(config_dir, 'config.yaml')
             logger.info(f"Loading config from: {config_path}")
             
             if not os.path.exists(config_path):
@@ -467,7 +489,8 @@ class KeyboardController:
     def load_colors(self) -> List[Tuple[int, int, int]]:
         """Load colors from pywal or use defaults"""
         if self.config.get('pywal', True):
-            colors = self.read_wal_colors('/home/duck/.cache/wal/colors')
+            wal_path = os.path.join(self.user_home, '.cache', 'wal', 'colors')
+            colors = self.read_wal_colors(wal_path)
             if colors:
                 logger.info(f"Loaded {len(colors)} colors from pywal")
                 return colors
@@ -544,12 +567,66 @@ class KeyboardController:
         
         return (0, 0, 0)  # Default to black
 
+    def get_hypr_user(self):
+        try:
+            result = subprocess.run(
+                ["pgrep", "-u", "1000", "-a", "Hyprland"],  # UID 1000 is common for the first user
+                capture_output=True, text=True
+            )
+            if result.returncode == 0 and result.stdout:
+                # Example output: 1234 Hyprland
+                for line in result.stdout.splitlines():
+                    parts = line.strip().split()
+                    pid = parts[0]
+                    # Get user from PID
+                    user_result = subprocess.run(
+                        ["ps", "-o", "user=", "-p", pid],
+                        capture_output=True, text=True
+                    )
+                    user = user_result.stdout.strip()
+                    return user
+            else:
+                # Fallback: find the user from loginctl
+                result = subprocess.run(["loginctl", "list-sessions"], capture_output=True, text=True)
+                for line in result.stdout.splitlines():
+                    if "seat0" in line and "tty" in line:
+                        session_id = line.split()[0]
+                        user_result = subprocess.run(
+                            ["loginctl", "show-session", session_id, "-p", "Name"],
+                            capture_output=True, text=True
+                        )
+                        return user_result.stdout.strip().split("=")[1]
+        except Exception:
+            pass
+        return None
+
+    def get_hyprland_signature_for_user(self, user):
+        try:
+            # Get the PID of Hyprland for that user
+            result = subprocess.run(
+                ["pgrep", "-u", user, "Hyprland"],
+                capture_output=True, text=True
+            )
+            pid = result.stdout.strip().split("\n")[0]
+
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                env = f.read().decode().split("\0")
+                for var in env:
+                    if var.startswith("HYPRLAND_INSTANCE_SIGNATURE="):
+                        return var.split("=", 1)[1]
+        except Exception:
+            pass
+        return None
+
     def get_hyprland_workspaces(self):
         """Get list of non-empty workspaces from Hyprland"""
         try:
+
+            user = os.environ.get('OPENRGB_USER')
+
             # Use hyprctl to get workspace info
             result = subprocess.run(
-                ['hyprctl', 'workspaces', '-j'],
+                ['su', f'{user}', '-c' ,'hyprctl --instance 0 workspaces -j'],
                 capture_output=True,
                 text=True,
                 timeout=1.0
@@ -616,6 +693,7 @@ class KeyboardController:
                     if current_workspaces != self.last_non_empty_workspaces:
                         self.last_non_empty_workspaces = current_workspaces
                         self.need_redraw = True
+                        self.update_lighting()
                         logger.info(f"Workspaces changed: {current_workspaces}")
                 except Exception as e:
                     logger.error(f"Error updating workspaces: {e}")
@@ -626,6 +704,7 @@ class KeyboardController:
                 if current_workspaces != self.last_non_empty_workspaces:
                     self.last_non_empty_workspaces = current_workspaces
                     self.need_redraw = True
+                    self.update_lighting()
                     logger.info(f"Workspaces changed: {current_workspaces}")
             except Exception as e:
                 logger.error(f"Error updating workspaces: {e}")
@@ -661,8 +740,8 @@ class KeyboardController:
                 self.need_redraw = True
                 # Update lighting after reload
                 self.update_lighting()
-            except Exception as e:
-                logger.error(f"Error reloading config: {e}")
+            except Exception as error:
+                logger.error(f"Error reloading config: {error}")
 
     def get_keys_positions(self, key_spec: Any) -> List[Tuple[int, int]]:
         """Get positions for a key or key group"""
@@ -929,195 +1008,16 @@ class KeyboardController:
         except Exception as e:
             logger.error(f"Error updating lighting: {e}")
             logger.error(traceback.format_exc())
-    
-    def recv_fd(self, sock):
-        """Receive a file descriptor from a Unix socket"""
-        data, ancdata, flags, addr = sock.recvmsg(1, socket.CMSG_LEN(struct.calcsize('i')))
-        for cmsg_level, cmsg_type, cmsg_data in ancdata:
-            if cmsg_level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
-                # Unpack the file descriptor from the ancillary data
-                fd = struct.unpack('i', cmsg_data)[0]
-                return fd
-        return None
 
-    def respond_to_challenge(self, conn, token):
-        """Respond to authentication challenge"""
+    def on_key_event(self, event):
+        """Handle keyboard events directly"""
         try:
-            # Wait for challenge with timeout
-            ready = select.select([conn], [], [], 5.0)  # 5 second timeout
-            if not ready[0]:
-                raise RuntimeError("Timeout waiting for challenge")
-                
-            challenge = conn.recv(16)
-            if not challenge or len(challenge) != 16:
-                raise RuntimeError("Invalid challenge received")
-            
-            response = hmac.new(token, challenge, 'sha256').digest()
-            conn.send(response)
+            if event.event_type == keyboard.KEY_DOWN:
+                self.on_press_str(event.name)
+            elif event.event_type == keyboard.KEY_UP:
+                self.on_release_str(event.name)
         except Exception as e:
-            logger.error(f"Error in challenge response: {e}")
-            raise
-
-    def connect_via_fd_passing(self):
-        """Connect to the root process and receive the pipe file descriptor"""
-        try:
-            # Get the socket info from the protected file
-            uid = os.getuid()
-            socket_info_file = f"/run/user/{uid}/openrgb-keyboard/socket_info"
-            
-            # Wait for the file to be created with timeout
-            timeout = 30  # 30 second timeout
-            start_time = time.time()
-            while time.time() - start_time < timeout:
-                if os.path.exists(socket_info_file):
-                    break
-                time.sleep(0.1)
-            else:
-                raise RuntimeError("Socket info file not found. Is the root process running?")
-            
-            # Read the socket name, auth token, and expected executable hash
-            with open(socket_info_file, 'r') as f:
-                lines = f.read().splitlines()
-                if len(lines) < 3:
-                    raise RuntimeError("Invalid socket info file format")
-                
-                socket_name = lines[0].strip()
-                auth_token_hex = lines[1].strip()
-                expected_exe_hash = lines[2].strip()
-            
-            # Verify our script hash matches the expected one
-            script_path = sys.argv[0]  # Path to this script
-            with open(script_path, 'rb') as f:
-                script_data = f.read()
-                current_hash = hashlib.sha256(script_data).hexdigest()
-            
-            if current_hash != expected_exe_hash:
-                raise RuntimeError(f"Script hash mismatch: {current_hash} != {expected_exe_hash}")
-            
-            # Decode the auth token
-            try:
-                auth_token = binascii.unhexlify(auth_token_hex)
-            except:
-                raise RuntimeError("Failed to decode authentication token")
-            
-            # Create abstract socket name
-            abstract_name = f"\0openrgb_keyboard_{socket_name}"
-            
-            # Connect to the control socket with timeout
-            control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            control_socket.settimeout(10.0)  # 10 second timeout
-            
-            try:
-                control_socket.connect(abstract_name)
-            except socket.error as e:
-                logger.error(f"Failed to connect to control socket: {e}")
-                logger.error("This might mean the root process has already closed the socket after a connection")
-                raise
-            
-            # Respond to authentication challenge with proper error handling
-            try:
-                # Wait for challenge with timeout
-                ready = select.select([control_socket], [], [], 5.0)
-                if not ready[0]:
-                    raise RuntimeError("Timeout waiting for challenge")
-                
-                challenge = control_socket.recv(16)
-                if not challenge or len(challenge) != 16:
-                    raise RuntimeError("Invalid challenge received")
-                
-                response = hmac.new(auth_token, challenge, 'sha256').digest()
-                control_socket.send(response)
-            except Exception as e:
-                control_socket.close()
-                raise RuntimeError(f"Challenge response failed: {e}")
-            
-            # Receive the file descriptor
-            self.pipe_fd = self.recv_fd(control_socket)
-            control_socket.close()
-            
-            if self.pipe_fd is None:
-                raise RuntimeError("Failed to receive file descriptor from root process")
-            
-            logger.info("Received pipe file descriptor from root process")
-            
-            # Start thread to read events
-            self.pipe_thread = threading.Thread(target=self.read_pipe_events, daemon=True)
-            self.pipe_thread.start()
-            logger.info("Pipe reader thread started")
-            
-        except Exception as e:
-            logger.error(f"Error connecting via FD passing: {e}")
-            logger.error(traceback.format_exc())
-            raise
-
-    def read_pipe_events(self):
-        """Read keyboard events from the pipe"""
-        try:
-            logger.info("Starting pipe reader thread")
-            # Use bytes buffer instead of string buffer
-            buffer = b""
-            
-            while self.pipe_fd:
-                # Check if there's data to read
-                r, _, _ = select.select([self.pipe_fd], [], [], 0.1)
-                if not r:
-                    continue
-                
-                try:
-                    # Read data as bytes
-                    data = os.read(self.pipe_fd, 4096)
-                    
-                    if not data:
-                        logger.info("Pipe closed by writer")
-                        break
-                    
-                    # Add to buffer and split into lines
-                    buffer += data
-                    lines = buffer.split(b'\n')
-                    
-                    # Process complete lines, keep incomplete in buffer
-                    buffer = lines[-1]  # Last element might be incomplete
-                    for line in lines[:-1]:
-                        try:
-                            # Decode only when needed
-                            line_str = line.decode('utf-8')
-                            event = json.loads(line_str)
-                            
-                            # Use cached/interned strings for event processing
-                            event_type = self.get_cached_string(event['type'])
-                            event_key = self.normalize_key_str(event['key'])
-                            
-                            if event_type == 'press':
-                                self.on_press_str(event_key)
-                            elif event_type == 'release':
-                                self.on_release_str(event_key)
-                        except (json.JSONDecodeError, UnicodeDecodeError):
-                            logger.error(f"Invalid data: {line}")
-                        except KeyError:
-                            logger.error(f"Missing keys in event: {line}")
-                        except Exception as e:
-                            logger.error(f"Error processing event: {e}")
-                    
-                except BlockingIOError:
-                    # No data available
-                    pass
-                except OSError as e:
-                    if e.errno == 11:  # Resource temporarily unavailable
-                        continue
-                    else:
-                        logger.error(f"OSError in pipe read: {e}")
-                        break
-                except Exception as e:
-                    logger.error(f"Unexpected error in pipe read: {e}")
-                    break
-                
-        except Exception as e:
-            logger.error(f"Error in pipe reader: {e}")
-            logger.error(traceback.format_exc())
-        finally:
-            if hasattr(self, 'pipe_fd') and self.pipe_fd:
-                os.close(self.pipe_fd)
-                self.pipe_fd = None
+            logger.error(f"Error in keyboard event handler: {e}")
 
     def on_press_str(self, key_name: str):
         """Handle key press events from string"""
@@ -1243,7 +1143,7 @@ class KeyboardController:
 
     def start_pywal_watcher(self):
         """Start watching pywal color file for changes"""
-        pywal_path = os.path.expanduser('~/.cache/wal')
+        pywal_path = os.path.join(self.user_home, '.cache', 'wal')
         if not os.path.exists(pywal_path):
             return
         
@@ -1255,7 +1155,7 @@ class KeyboardController:
 
     def start_config_watcher(self):
         """Start watching config file for changes"""
-        config_path = os.path.expanduser('~/.config/openrgb-keyboard-highlighter')
+        config_path = os.path.join(self.user_home, '.config', 'openrgb-keyboard-highlighter')
         if not os.path.exists(config_path):
             os.makedirs(config_path, exist_ok=True)
             logger.info(f"Created config directory: {config_path}")
@@ -1289,8 +1189,9 @@ class KeyboardController:
     def run(self):
         """Main application loop"""
         try:
-            # Connect to the root process using FD passing
-            self.connect_via_fd_passing()
+            # Set up keyboard hook for direct keyboard access
+            self.keyboard_hook = keyboard.hook(self.on_key_event)
+            logger.info("Keyboard hook installed")
             
             if self.wm_integration_enabled:
                 self.update_workspaces()
@@ -1314,7 +1215,6 @@ class KeyboardController:
             # Main loop
             logger.info("Entering main loop (Press Ctrl+C to exit)")
             while True:
-                time.sleep(1)
                 # Check for pywal updates
                 if self.pywal_updated:
                     self.reload_pywal_colors()
@@ -1327,9 +1227,8 @@ class KeyboardController:
                     self.update_workspaces()
         except KeyboardInterrupt:
             logger.info("Exiting...")
-            if hasattr(self, 'pipe_fd') and self.pipe_fd:
-                os.close(self.pipe_fd)
-                self.pipe_fd = None
+            if self.keyboard_hook:
+                keyboard.unhook(self.keyboard_hook)
             if self.pywal_watchdog_observer:
                 self.pywal_watchdog_observer.stop()
                 self.pywal_watchdog_observer.join()

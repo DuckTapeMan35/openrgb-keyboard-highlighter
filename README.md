@@ -2,9 +2,6 @@
 
 Support for highlighting keys when held according to a configuration file with pywal, i3wm and hyprland integration, supports key combinations of any order/size
 
-## IMPORTANT
-I have done my best to secure this application such that keypress events cannot be sniffed by some third party, however, this is still theoritically possible and can be a vulnerability you are introducing in your system if you use wayland, the reason this is not a concern for x11 is because x11 has no protections against keyloggers whereas a keylogger must have sudo permissions on wayland.
-
 ## Requirements
 
 ### General requirements
@@ -23,11 +20,11 @@ I have done my best to secure this application such that keypress events cannot 
 - pyyaml
 - openrgb-python
 
-`sudo pacman -S i3ipc pynput watchdog pyyaml`
-
-then install openrgb-python, for example using yay
-
-`yay -S openrgb-python`
+```bash
+sudo python -m venv /root/openrgb_keyboard_highlighter_venv
+sudo /root/openrgb_keyboard_highlighter_venv/bin/pip install --upgrade pip
+sudo /root/openrgb_keyboard_highlighter_venv/bin/pip install keyboard openrgb-python watchdog yaml i3ipc
+```
 
 ## Setup
 
@@ -40,7 +37,9 @@ chmod +x setup.sh
 
 You need yay or paru for this setup script to work.
 
-This will create a daemon that listens to your keypresses and writes them to a socket, then you can use the command `openrgb_highlighter` to start the application. If you want this to work on startup you need to start it in your window manager's config file (so it starts as a child process of the window manager), otherwise the window manager integrations will not work. If you don't use a window manager/don't want the integrations, you can make a daemon and start/enable it, however, note that `openrgb_highlighter` should be run as a user without root permissions and must also run after `openrgb_kb_listener`. Timing is very important and can be hard to get right. Also there is a 5 second delay on startup to ensure the openrgb server is running correctly so it's normal if the lighting effect takes a bit on startup, I couldn't get this delay to be smaller reliably.
+This will create a daemon for root that runs the highlighter. There is a 5 second delay on startup to ensure the openrgb server is running correctly so it's normal if the lighting effect takes a bit on startup, I couldn't get this delay to be smaller reliably.
+
+If you don't want to run this as a daemon (as it is intended) it must be run as root and with the environment variable `OPENRGB_USER` set as your user.
 
 Afterwards simply edit the config file under `.config/openrgb-keyboard-highlighter/`, below I use my personal config file as an example.
 
