@@ -119,7 +119,8 @@ class KeyboardController:
         'config_updated', 'pywal_watchdog_observer', 'config_watchdog_observer',
         'current_mode', 'modifier_keys', 'current_key_states', 'need_redraw', 'last_non_empty_workspaces',
         'redraw_count', 'skip_count', '_string_cache', 'previous_mode',
-        'key_name_to_position', 'keyboard_hook', 'wm_integration_enabled', 'wm_lock', 'user_home'
+        'key_name_to_position', 'keyboard_hook', 'wm_integration_enabled', 'wm_lock', 'user_home',
+        'mangowc_process', 'mangowc_thread'
     ]
 
     def __init__(self):
@@ -175,7 +176,7 @@ class KeyboardController:
             
             # Get window manager type from config
             self.wm_type = self.config.get('window_manager', 'i3').lower()  # Default to i3
-            if self.wm_type not in ['sway', 'i3', 'hyprland']:
+            if self.wm_type not in ['sway', 'i3', 'hyprland', 'mangowc']:
                 logger.warning(f"Invalid window manager '{self.wm_type}'. Defaulting to 'i3'")
                 self.wm_type = 'i3'
                 
@@ -193,6 +194,10 @@ class KeyboardController:
             self.config_watchdog_observer = None
             self.current_mode = "base"
             self.previous_mode = "base"
+            
+            # Initialize mangowc attributes
+            self.mangowc_process = None
+            self.mangowc_thread = None
             
             # Define modifier keys
             self.modifier_keys = {
@@ -621,7 +626,6 @@ class KeyboardController:
     def get_hyprland_workspaces(self):
         """Get list of non-empty workspaces from Hyprland"""
         try:
-
             user = os.environ.get('OPENRGB_USER')
 
             # Use hyprctl to get workspace info
@@ -665,6 +669,89 @@ class KeyboardController:
             logger.error(f"Error getting i3/sway workspaces: {e}")
             return []
 
+    def get_mangowc_workspaces(self):
+        """Get list of non-empty workspaces from mangowc/mmsg -g"""
+        try:
+            user = os.environ.get('OPENRGB_USER')
+            if not user:
+                logger.error("OPENRGB_USER environment variable not set")
+                return []
+            
+            # Get user info
+            try:
+                user_info = pwd.getpwnam(user)
+                user_uid = user_info.pw_uid
+                user_home = user_info.pw_dir
+            except Exception as e:
+                logger.error(f"Error getting user info: {e}")
+                return []
+            
+            # Set up environment
+            env = os.environ.copy()
+            env['DISPLAY'] = ':0'
+            env['XDG_RUNTIME_DIR'] = f"/run/user/{user_uid}"
+            env['HOME'] = user_home
+            env['USER'] = user
+            env['LOGNAME'] = user
+            
+            # Run mmsg directly (as root, but with user's environment)
+            result = subprocess.run(
+                ['mmsg', '-g'],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                env=env
+            )
+            
+            if result.returncode == 0:
+                lines = result.stdout.strip().split('\n')
+                workspaces = self.parse_mmsg_output(lines)
+                logger.debug(f"Parsed {len(workspaces)} workspaces from mmsg -g output")
+                return workspaces
+            else:
+                logger.error(f"mmsg -g command failed with return code {result.returncode}")
+                if result.stderr:
+                    logger.error(f"stderr: {result.stderr}")
+                return []
+                    
+        except FileNotFoundError:
+            logger.error("mmsg command not found. Is mangohud/mangoWC installed?")
+            return []
+        except subprocess.TimeoutExpired:
+            logger.error("mmsg -g command timed out")
+            return []
+        except Exception as e:
+            logger.error(f"Error getting mangowc workspaces: {e}")
+            logger.error(traceback.format_exc())
+            return []
+
+    def parse_mmsg_output(self, lines: List[str]) -> List[str]:
+        """Parse mmsg -g output to extract occupied tags/workspaces"""
+        occupied_workspaces = []
+        
+        # First pass: look for tag lines
+        for line in lines:
+            line = line.strip()
+            if "tag" in line and line.startswith("HDMI"):
+                parts = line.split()
+                if len(parts) >= 6:
+                    try:
+                        tag_num = parts[2]  # The tag number (1-9)
+                        windows_count = int(parts[4])  # Number of windows
+                        
+                        if windows_count > 0:
+                            occupied_workspaces.append(tag_num)
+                            logger.debug(f"Tag {tag_num} has {windows_count} windows")
+                    except (IndexError, ValueError) as e:
+                        logger.debug(f"Error parsing mmsg line '{line}': {e}")
+                    except:
+                        pass
+        
+        # Deduplicate and sort
+        result = sorted(list(set(occupied_workspaces)))
+        logger.debug(f"Found occupied workspaces: {result}")
+        return result
+
     def find_non_empty_workspaces(self):
         """Get list of non-empty workspaces from the configured WM"""
         if not self.wm_integration_enabled:
@@ -675,7 +762,8 @@ class KeyboardController:
                 return self.get_i3_or_sway_workspaces()
             elif self.wm_type == 'hyprland':
                 return self.get_hyprland_workspaces()
-                
+            elif self.wm_type == 'mangowc':
+                return self.get_mangowc_workspaces()
         except Exception as e:
             logger.error(f"Error getting workspaces: {e}")
         return []
@@ -1111,6 +1199,63 @@ class KeyboardController:
             except:
                 pass
 
+    def listen_mangowc_events(self):
+        """Listen for mangowc workspace events via mmsg -w"""
+        try:
+            # Start mmsg in watch mode
+            cmd = ['mmsg', '-w']
+            logger.info(f"Starting mangowc listener with command: {' '.join(cmd)}")
+            
+            self.mangowc_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,  # Line buffered
+                universal_newlines=True
+            )
+            
+            logger.info(f"Connected to mangowc event stream (PID: {self.mangowc_process.pid})")
+            
+            while True:
+                # Check if we should stop
+                if not self.wm_integration_enabled:
+                    break
+                    
+                # Check if process is still running
+                if self.mangowc_process.poll() is not None:
+                    logger.error("mmsg process terminated")
+                    break
+                
+                # Read available output
+                ready, _, _ = select.select([self.mangowc_process.stdout], [], [], 0.1)
+                if ready:
+                    line = self.mangowc_process.stdout.readline()
+                    if not line:
+                        break
+                        
+                    line = line.strip()
+                    logger.debug(f"mmsg event: {line}")
+                    
+                    # Parse the line for tag updates
+                    if line and "tag" in line:
+                        # We got a tag update, update workspaces
+                        self.update_workspaces()
+                        
+        except Exception as e:
+            logger.error(f"Error in mangowc listener: {e}")
+        finally:
+            # Clean up
+            if hasattr(self, 'mangowc_process') and self.mangowc_process:
+                try:
+                    self.mangowc_process.terminate()
+                    self.mangowc_process.wait(timeout=2)
+                except:
+                    try:
+                        self.mangowc_process.kill()
+                    except:
+                        pass
+
     def start_wm_listener(self):
         """Listen for window manager events"""
         if not self.wm_integration_enabled:
@@ -1125,6 +1270,9 @@ class KeyboardController:
             elif self.wm_type == 'hyprland':
                 logger.info("Starting Hyprland event listener")
                 self.listen_hyprland_events()
+            elif self.wm_type == 'mangowc':
+                logger.info("Starting mangowc event listener")
+                self.listen_mangowc_events()
         except Exception as e:
             logger.error(f"Error in WM listener: {e}")
 
@@ -1225,6 +1373,10 @@ class KeyboardController:
                 # Periodically update workspaces only if integration enabled
                 if self.wm_integration_enabled:
                     self.update_workspaces()
+                    
+                # Small sleep to prevent CPU spinning
+                time.sleep(0.1)
+                
         except KeyboardInterrupt:
             logger.info("Exiting...")
             if self.keyboard_hook:
@@ -1235,6 +1387,18 @@ class KeyboardController:
             if self.config_watchdog_observer:
                 self.config_watchdog_observer.stop()
                 self.config_watchdog_observer.join()
+            
+            # Clean up mangowc process if running
+            if hasattr(self, 'mangowc_process') and self.mangowc_process:
+                try:
+                    self.mangowc_process.terminate()
+                    self.mangowc_process.wait(timeout=1)
+                except:
+                    try:
+                        self.mangowc_process.kill()
+                    except:
+                        pass
+            
             # Turn off keyboard lights
             try:
                 for led_index in range(len(self.matrix_zone.colors)):
@@ -1253,3 +1417,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Critical error: {e}")
         logger.critical(traceback.format_exc())
+
