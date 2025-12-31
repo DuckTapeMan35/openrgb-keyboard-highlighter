@@ -681,28 +681,22 @@ class KeyboardController:
             try:
                 user_info = pwd.getpwnam(user)
                 user_uid = user_info.pw_uid
-                user_home = user_info.pw_dir
             except Exception as e:
                 logger.error(f"Error getting user info: {e}")
                 return []
             
-            # Set up environment
-            env = os.environ.copy()
-            env['DISPLAY'] = ':0'
-            env['XDG_RUNTIME_DIR'] = f"/run/user/{user_uid}"
-            env['HOME'] = user_home
-            env['USER'] = user
-            env['LOGNAME'] = user
-            
             # Run mmsg directly (as root, but with user's environment)
             result = subprocess.run(
-                ['mmsg', '-g'],
+                [
+                    'su', '-', user, '-c',
+                    'XDG_RUNTIME_DIR=/run/user/{uid} WAYLAND_DISPLAY=wayland-0 mmsg -g'
+                    .format(uid=user_uid)
+                ],
                 capture_output=True,
                 text=True,
-                timeout=2.0,
-                env=env
+                timeout=2.0
             )
-            
+
             if result.returncode == 0:
                 lines = result.stdout.strip().split('\n')
                 workspaces = self.parse_mmsg_output(lines)
@@ -715,7 +709,7 @@ class KeyboardController:
                 return []
                     
         except FileNotFoundError:
-            logger.error("mmsg command not found. Is mangohud/mangoWC installed?")
+            logger.error("mmsg command not found. Is mangoWC installed?")
             return []
         except subprocess.TimeoutExpired:
             logger.error("mmsg -g command timed out")
@@ -1199,63 +1193,6 @@ class KeyboardController:
             except:
                 pass
 
-    def listen_mangowc_events(self):
-        """Listen for mangowc workspace events via mmsg -w"""
-        try:
-            # Start mmsg in watch mode
-            cmd = ['mmsg', '-w']
-            logger.info(f"Starting mangowc listener with command: {' '.join(cmd)}")
-            
-            self.mangowc_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,  # Line buffered
-                universal_newlines=True
-            )
-            
-            logger.info(f"Connected to mangowc event stream (PID: {self.mangowc_process.pid})")
-            
-            while True:
-                # Check if we should stop
-                if not self.wm_integration_enabled:
-                    break
-                    
-                # Check if process is still running
-                if self.mangowc_process.poll() is not None:
-                    logger.error("mmsg process terminated")
-                    break
-                
-                # Read available output
-                ready, _, _ = select.select([self.mangowc_process.stdout], [], [], 0.1)
-                if ready:
-                    line = self.mangowc_process.stdout.readline()
-                    if not line:
-                        break
-                        
-                    line = line.strip()
-                    logger.debug(f"mmsg event: {line}")
-                    
-                    # Parse the line for tag updates
-                    if line and "tag" in line:
-                        # We got a tag update, update workspaces
-                        self.update_workspaces()
-                        
-        except Exception as e:
-            logger.error(f"Error in mangowc listener: {e}")
-        finally:
-            # Clean up
-            if hasattr(self, 'mangowc_process') and self.mangowc_process:
-                try:
-                    self.mangowc_process.terminate()
-                    self.mangowc_process.wait(timeout=2)
-                except:
-                    try:
-                        self.mangowc_process.kill()
-                    except:
-                        pass
-
     def start_wm_listener(self):
         """Listen for window manager events"""
         if not self.wm_integration_enabled:
@@ -1270,9 +1207,6 @@ class KeyboardController:
             elif self.wm_type == 'hyprland':
                 logger.info("Starting Hyprland event listener")
                 self.listen_hyprland_events()
-            elif self.wm_type == 'mangowc':
-                logger.info("Starting mangowc event listener")
-                self.listen_mangowc_events()
         except Exception as e:
             logger.error(f"Error in WM listener: {e}")
 
@@ -1417,4 +1351,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Critical error: {e}")
         logger.critical(traceback.format_exc())
-
