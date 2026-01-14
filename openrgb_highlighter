@@ -14,8 +14,6 @@ from typing import Dict, List, Tuple, Any
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import subprocess
-import select
-import socket
 import sys
 import keyboard
 import pwd
@@ -119,8 +117,7 @@ class KeyboardController:
         'config_updated', 'pywal_watchdog_observer', 'config_watchdog_observer',
         'current_mode', 'modifier_keys', 'current_key_states', 'need_redraw', 'last_non_empty_workspaces',
         'redraw_count', 'skip_count', '_string_cache', 'previous_mode',
-        'key_name_to_position', 'keyboard_hook', 'wm_integration_enabled', 'wm_lock', 'user_home',
-        'mangowc_process', 'mangowc_thread'
+        'key_name_to_position', 'keyboard_hook', 'wm_integration_enabled', 'wm_lock', 'user_home'
     ]
 
     def __init__(self):
@@ -194,10 +191,6 @@ class KeyboardController:
             self.config_watchdog_observer = None
             self.current_mode = "base"
             self.previous_mode = "base"
-            
-            # Initialize mangowc attributes
-            self.mangowc_process = None
-            self.mangowc_thread = None
             
             # Define modifier keys
             self.modifier_keys = {
@@ -336,9 +329,7 @@ class KeyboardController:
             if not os.path.exists(config_path):
                 logger.info("Config file not found, using default configuration")
                 return {
-                    'pywal': True,
-                    'workspaces': False,
-                    'key_positions': {},
+                    'pywal': False,
                     'log_level': 'INFO',  # Default log level
                     'modes': {
                         'base': {
@@ -366,85 +357,59 @@ class KeyboardController:
             return {}
 
     def parse_key_positions(self) -> Dict[str, List[Tuple[int, int]]]:
-        """Parse key positions from config, with memory optimization"""
-        positions = {}
-        
-        # Create 'all' key group using actual keyboard dimensions
-        positions['all'] = [(r, c) for r in range(self.rows) for c in range(self.cols)]
-        
+        positions: Dict[str, List[Tuple[int, int]]] = {}
+
+        rows, cols = self.rows, self.cols
+        key_lookup = self.key_name_to_position
+        intern = sys.intern
+        logger_warn = logger.warning
+
+        # Create 'all' group
+        positions['all'] = [(r, c) for r in range(rows) for c in range(cols)]
+
+        def parse_position(item):
+            """Return (row, col) or None"""
+            if isinstance(item, (tuple, list)) and len(item) == 2:
+                return int(item[0]), int(item[1])
+
+            if isinstance(item, str):
+                s = item.strip().lower()
+
+                if s in key_lookup:
+                    return key_lookup[s]
+
+                if s.startswith('(') and s.endswith(')'):
+                    parts = s[1:-1].split(',')
+                    if len(parts) == 2:
+                        try:
+                            return int(parts[0]), int(parts[1])
+                        except ValueError:
+                            return None
+            return None
+
         # Load positions from config
-        if 'key_positions' in self.config:
-            for key, value in self.config['key_positions'].items():
-                try:
-                    # Intern the key name to reduce duplication
-                    interned_key = sys.intern(key)
-                    
-                    if isinstance(value, list):
-                        # Convert all elements to (int, int)
-                        converted = []
-                        for item in value:
-                            if isinstance(item, (list, tuple)) and len(item) == 2:
-                                converted.append((int(item[0]), int(item[1])))
-                            elif isinstance(item, str):
-                                # Handle key names
-                                normalized_name = item.strip().lower()
-                                if normalized_name in self.key_name_to_position:
-                                    converted.append(self.key_name_to_position[normalized_name])
-                                elif item.startswith('(') and item.endswith(')'):
-                                    # Safely parse string tuple
-                                    try:
-                                        # Remove parentheses and split
-                                        stripped = item.strip()[1:-1]
-                                        parts = stripped.split(',')
-                                        if len(parts) == 2:
-                                            row = int(parts[0].strip())
-                                            col = int(parts[1].strip())
-                                            converted.append((row, col))
-                                        else:
-                                            logger.warning(f"Invalid tuple format for key '{interned_key}': {item}")
-                                    except ValueError as e:
-                                        logger.warning(f"Error parsing position '{item}' for key '{interned_key}': {e}")
-                                else:
-                                    logger.warning(f"Unknown key name or invalid format for key '{interned_key}': {item}")
-                            else:
-                                logger.warning(f"Invalid position format for key '{interned_key}': {item}")
-                        positions[interned_key] = converted
-                    elif isinstance(value, (tuple, list)) and len(value) == 2:
-                        # Single position
-                        positions[interned_key] = [(int(value[0]), int(value[1]))]
-                    elif isinstance(value, str):
-                        # Handle key names
-                        normalized_name = value.strip().lower()
-                        if normalized_name in self.key_name_to_position:
-                            positions[interned_key] = [self.key_name_to_position[normalized_name]]
-                        elif value.startswith('(') and value.endswith(')'):
-                            # Safely parse string tuple
-                            try:
-                                # Remove parentheses and split
-                                stripped = value.strip()[1:-1]
-                                parts = stripped.split(',')
-                                if len(parts) == 2:
-                                    row = int(parts[0].strip())
-                                    col = int(parts[1].strip())
-                                    positions[interned_key] = [(row, col)]
-                                else:
-                                    logger.warning(f"Invalid tuple format for key '{interned_key}': {value}")
-                            except ValueError as e:
-                                logger.warning(f"Error parsing position '{value}' for key '{interned_key}': {e}")
-                        else:
-                            logger.warning(f"Unknown key name or invalid format for key '{interned_key}': {value}")
-                    else:
-                        logger.warning(f"Invalid position format for key '{interned_key}': {value}")
-                        positions[interned_key] = []
-                except Exception as e:
-                    logger.warning(f"Error parsing position for key '{key}': {e}")
-                    positions[sys.intern(key)] = []
-        
-        # Add default positions for essential keys as integers
+        config_positions = self.config.get('key_positions', {})
+        for key, value in config_positions.items():
+            interned_key = intern(key)
+
+            # Normalize value into a list
+            items = value if isinstance(value, list) else [value]
+
+            parsed = []
+            for item in items:
+                pos = parse_position(item)
+                if pos is not None:
+                    parsed.append(pos)
+                else:
+                    logger_warn(f"Invalid position for key '{interned_key}': {item}")
+
+            positions[interned_key] = parsed
+
+        # Defaults
         defaults = {
             'super': [(5, 1)],
             'enter': [(3, 13)],
-            'numbers': [(1,1), (1,2), (1,3), (1,4), (1,5), (1,6), (1,7), (1,8), (1,9), (1,10)],
+            'numbers': [(1, i) for i in range(1, 11)],
             'arrows': [(5,14), (5,15), (5,16), (4,15)],
             'shift': [(4,0)],
             'alt': [(5,2)],
@@ -458,22 +423,13 @@ class KeyboardController:
             'esc': [(1,0)],
             'backspace': [(1,15)],
         }
-        
+
         for key, pos_list in defaults.items():
-            if key not in positions:
-                # Convert to list of integer tuples and intern the key
-                interned_key = sys.intern(key)
-                positions[interned_key] = [(int(r), int(c)) for r, c in pos_list]
-                logger.info(f"Added default position for key '{interned_key}'")
-        
-        # Ensure all positions are integers
-        for key in list(positions.keys()):
-            new_list = []
-            for pos in positions[key]:
-                if isinstance(pos, (tuple, list)) and len(pos) == 2:
-                    new_list.append((int(pos[0]), int(pos[1])))
-            positions[key] = new_list
-        
+            ikey = intern(key)
+            if ikey not in positions:
+                positions[ikey] = pos_list
+                logger.info(f"Added default position for key '{ikey}'")
+
         return positions
 
     def find_keyboard(self):
@@ -572,56 +528,62 @@ class KeyboardController:
         
         return (0, 0, 0)  # Default to black
 
-    def get_hypr_user(self):
+    def get_mangowc_workspaces(self):
+        """Get list of non-empty workspaces from mangoWC using mmsg -g"""
         try:
+            user = os.environ.get('OPENRGB_USER')
+            if not user:
+                logger.error("OPENRGB_USER environment variable not set")
+                return []
+            
+            # Get user info
+            try:
+                user_info = pwd.getpwnam(user)
+                user_uid = user_info.pw_uid
+            except Exception as e:
+                logger.error(f"Error getting user info: {e}")
+                return []
+            
+            # Run mmsg -g to get workspace info
             result = subprocess.run(
-                ["pgrep", "-u", "1000", "-a", "Hyprland"],  # UID 1000 is common for the first user
-                capture_output=True, text=True
+                [
+                    'su', '-', user, '-c',
+                    f'XDG_RUNTIME_DIR=/run/user/{user_uid} WAYLAND_DISPLAY=wayland-0 mmsg -g'
+                ],
+                capture_output=True,
+                text=True,
+                timeout=1.0
             )
-            if result.returncode == 0 and result.stdout:
-                # Example output: 1234 Hyprland
-                for line in result.stdout.splitlines():
-                    parts = line.strip().split()
-                    pid = parts[0]
-                    # Get user from PID
-                    user_result = subprocess.run(
-                        ["ps", "-o", "user=", "-p", pid],
-                        capture_output=True, text=True
-                    )
-                    user = user_result.stdout.strip()
-                    return user
-            else:
-                # Fallback: find the user from loginctl
-                result = subprocess.run(["loginctl", "list-sessions"], capture_output=True, text=True)
-                for line in result.stdout.splitlines():
-                    if "seat0" in line and "tty" in line:
-                        session_id = line.split()[0]
-                        user_result = subprocess.run(
-                            ["loginctl", "show-session", session_id, "-p", "Name"],
-                            capture_output=True, text=True
-                        )
-                        return user_result.stdout.strip().split("=")[1]
-        except Exception:
-            pass
-        return None
-
-    def get_hyprland_signature_for_user(self, user):
-        try:
-            # Get the PID of Hyprland for that user
-            result = subprocess.run(
-                ["pgrep", "-u", user, "Hyprland"],
-                capture_output=True, text=True
-            )
-            pid = result.stdout.strip().split("\n")[0]
-
-            with open(f"/proc/{pid}/environ", "rb") as f:
-                env = f.read().decode().split("\0")
-                for var in env:
-                    if var.startswith("HYPRLAND_INSTANCE_SIGNATURE="):
-                        return var.split("=", 1)[1]
-        except Exception:
-            pass
-        return None
+            
+            if result.returncode != 0:
+                logger.error(f"mmsg -g command failed with return code {result.returncode}")
+                return []
+            
+            lines = result.stdout.strip().split('\n')
+            non_empty = []
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                # Parse lines like: HDMI-A-1 tag 1 0 1 0
+                parts = line.split()
+                if len(parts) >= 6 and parts[1] == "tag":
+                    try:
+                        tag_num = parts[2]  # Tag number (1-9)
+                        windows = int(parts[4])  # Window count
+                        
+                        # Only consider tags 1-9 with windows
+                        if windows > 0 and tag_num.isdigit() and 1 <= int(tag_num) <= 9:
+                            non_empty.append(tag_num)
+                    except (IndexError, ValueError) as e:
+                        logger.debug(f"Error parsing mmsg -g line '{line}': {e}")
+            
+            return non_empty
+        except Exception as e:
+            logger.error(f"Error getting mangoWC workspaces: {e}")
+            return []
 
     def get_hyprland_workspaces(self):
         """Get list of non-empty workspaces from Hyprland"""
@@ -669,83 +631,6 @@ class KeyboardController:
             logger.error(f"Error getting i3/sway workspaces: {e}")
             return []
 
-    def get_mangowc_workspaces(self):
-        """Get list of non-empty workspaces from mangowc/mmsg -g"""
-        try:
-            user = os.environ.get('OPENRGB_USER')
-            if not user:
-                logger.error("OPENRGB_USER environment variable not set")
-                return []
-            
-            # Get user info
-            try:
-                user_info = pwd.getpwnam(user)
-                user_uid = user_info.pw_uid
-            except Exception as e:
-                logger.error(f"Error getting user info: {e}")
-                return []
-            
-            # Run mmsg directly (as root, but with user's environment)
-            result = subprocess.run(
-                [
-                    'su', '-', user, '-c',
-                    'XDG_RUNTIME_DIR=/run/user/{uid} WAYLAND_DISPLAY=wayland-0 mmsg -g'
-                    .format(uid=user_uid)
-                ],
-                capture_output=True,
-                text=True,
-                timeout=2.0
-            )
-
-            if result.returncode == 0:
-                lines = result.stdout.strip().split('\n')
-                workspaces = self.parse_mmsg_output(lines)
-                logger.debug(f"Parsed {len(workspaces)} workspaces from mmsg -g output")
-                return workspaces
-            else:
-                logger.error(f"mmsg -g command failed with return code {result.returncode}")
-                if result.stderr:
-                    logger.error(f"stderr: {result.stderr}")
-                return []
-                    
-        except FileNotFoundError:
-            logger.error("mmsg command not found. Is mangoWC installed?")
-            return []
-        except subprocess.TimeoutExpired:
-            logger.error("mmsg -g command timed out")
-            return []
-        except Exception as e:
-            logger.error(f"Error getting mangowc workspaces: {e}")
-            logger.error(traceback.format_exc())
-            return []
-
-    def parse_mmsg_output(self, lines: List[str]) -> List[str]:
-        """Parse mmsg -g output to extract occupied tags/workspaces"""
-        occupied_workspaces = []
-        
-        # First pass: look for tag lines
-        for line in lines:
-            line = line.strip()
-            if "tag" in line and line.startswith("HDMI"):
-                parts = line.split()
-                if len(parts) >= 6:
-                    try:
-                        tag_num = parts[2]  # The tag number (1-9)
-                        windows_count = int(parts[4])  # Number of windows
-                        
-                        if windows_count > 0:
-                            occupied_workspaces.append(tag_num)
-                            logger.debug(f"Tag {tag_num} has {windows_count} windows")
-                    except (IndexError, ValueError) as e:
-                        logger.debug(f"Error parsing mmsg line '{line}': {e}")
-                    except:
-                        pass
-        
-        # Deduplicate and sort
-        result = sorted(list(set(occupied_workspaces)))
-        logger.debug(f"Found occupied workspaces: {result}")
-        return result
-
     def find_non_empty_workspaces(self):
         """Get list of non-empty workspaces from the configured WM"""
         if not self.wm_integration_enabled:
@@ -766,30 +651,17 @@ class KeyboardController:
         """Update workspace status (only if integration enabled)"""
         if not self.wm_integration_enabled:
             return
-            
-        if self.wm_lock:
-            with self.wm_lock:
-                try:
-                    current_workspaces = set(self.find_non_empty_workspaces())
-                    # Only mark for redraw if workspaces have changed
-                    if current_workspaces != self.last_non_empty_workspaces:
-                        self.last_non_empty_workspaces = current_workspaces
-                        self.need_redraw = True
-                        self.update_lighting()
-                        logger.info(f"Workspaces changed: {current_workspaces}")
-                except Exception as e:
-                    logger.error(f"Error updating workspaces: {e}")
-        else:
-            try:
-                current_workspaces = set(self.find_non_empty_workspaces())
-                # Only mark for redraw if workspaces have changed
-                if current_workspaces != self.last_non_empty_workspaces:
-                    self.last_non_empty_workspaces = current_workspaces
-                    self.need_redraw = True
-                    self.update_lighting()
-                    logger.info(f"Workspaces changed: {current_workspaces}")
-            except Exception as e:
-                logger.error(f"Error updating workspaces: {e}")
+        
+        try:
+            current_workspaces = set(self.find_non_empty_workspaces())
+            # Only mark for redraw if workspaces have changed
+            if current_workspaces != self.last_non_empty_workspaces:
+                self.last_non_empty_workspaces = current_workspaces
+                self.need_redraw = True
+                self.update_lighting()
+                logger.info(f"Workspaces changed: {current_workspaces}")
+        except Exception as e:
+            logger.error(f"Error updating workspaces: {e}")
 
     def reload_config(self):
         """Reload configuration from file"""
@@ -1141,88 +1013,6 @@ class KeyboardController:
         except Exception as e:
             logger.error(f"Error in on_release: {e}")
 
-    def listen_hyprland_events(self):
-        """Listen for Hyprland workspace events"""
-        try:
-            # Get the Hyprland instance signature
-            instance_sig = os.getenv('HYPRLAND_INSTANCE_SIGNATURE')
-            if not instance_sig:
-                logger.error("HYPRLAND_INSTANCE_SIGNATURE not set")
-                return
-                
-            # Get XDG runtime directory
-            xdg_runtime_dir = os.getenv('XDG_RUNTIME_DIR')
-            if not xdg_runtime_dir:
-                logger.error("XDG_RUNTIME_DIR not set, using fallback")
-                xdg_runtime_dir = f"/run/user/{os.getuid()}"
-                
-            # Correct socket path using XDG_RUNTIME_DIR
-            socket_path = os.path.join(xdg_runtime_dir, 'hypr', instance_sig, '.socket2.sock')
-            
-            if not os.path.exists(socket_path):
-                logger.error(f"Hyprland socket not found at {socket_path}")
-                return
-                
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.connect(socket_path)
-            
-            logger.info("Connected to Hyprland event socket")
-                
-            while True:
-                # Check if we should stop
-                if not self.wm_integration_enabled:
-                    break
-                    
-                ready = select.select([sock], [], [], 1)
-                if ready[0]:
-                    data = sock.recv(4096)
-                    if not data:
-                        break
-                        
-                    event = data.decode().strip()
-                    # Handle relevant events
-                    if event.startswith(("workspace>>", "openwindow>>", "closewindow>>", "movewindow>>")):
-                        logger.debug(f"Hyprland event: {event}")
-                        self.update_workspaces()
-                        self.update_lighting()
-        except Exception as e:
-            logger.error(f"Error in Hyprland listener: {e}")
-        finally:
-            try:
-                sock.close()
-            except:
-                pass
-
-    def start_wm_listener(self):
-        """Listen for window manager events"""
-        if not self.wm_integration_enabled:
-            return
-            
-        try:
-            if (self.wm_type == 'i3' or self.wm_type == 'sway') and I3_AVAILABLE:
-                i3 = i3ipc.Connection()
-                i3.on('window', self.on_wm_event)
-                logger.info("Starting i3 event listener")
-                i3.main()
-            elif self.wm_type == 'hyprland':
-                logger.info("Starting Hyprland event listener")
-                self.listen_hyprland_events()
-        except Exception as e:
-            logger.error(f"Error in WM listener: {e}")
-
-    def on_wm_event(self, i3, event):
-        """Handle window manager events"""
-        if not self.wm_integration_enabled:
-            return
-            
-        try:
-            if (self.wm_type == 'i3' or self.wm_type == 'sway'):
-                if event.change in ['new', 'close', 'move']:
-                    self.update_workspaces()
-                    self.update_lighting()
-        except Exception as e:
-            logger.error(f"Error in WM event handler: {e}")
-
     def start_pywal_watcher(self):
         """Start watching pywal color file for changes"""
         pywal_path = os.path.join(self.user_home, '.cache', 'wal')
@@ -1275,14 +1065,6 @@ class KeyboardController:
             self.keyboard_hook = keyboard.hook(self.on_key_event)
             logger.info("Keyboard hook installed")
             
-            if self.wm_integration_enabled:
-                self.update_workspaces()
-                
-                # Start WM listener thread only if enabled
-                self.wm_thread = threading.Thread(target=self.start_wm_listener, daemon=True)
-                self.wm_thread.start()
-                logger.info(f"{self.wm_type} listener started")
-            
             # Start pywal file watcher if enabled
             if self.config.get('pywal', True):
                 self.start_pywal_watcher()
@@ -1303,11 +1085,9 @@ class KeyboardController:
                 # Check for config updates
                 if self.config_updated:
                     self.reload_config()
-                
-                # Periodically update workspaces only if integration enabled
+                # Update workspaces periodically if integration enabled
                 if self.wm_integration_enabled:
                     self.update_workspaces()
-                    
                 # Small sleep to prevent CPU spinning
                 time.sleep(0.1)
                 
@@ -1321,17 +1101,6 @@ class KeyboardController:
             if self.config_watchdog_observer:
                 self.config_watchdog_observer.stop()
                 self.config_watchdog_observer.join()
-            
-            # Clean up mangowc process if running
-            if hasattr(self, 'mangowc_process') and self.mangowc_process:
-                try:
-                    self.mangowc_process.terminate()
-                    self.mangowc_process.wait(timeout=1)
-                except:
-                    try:
-                        self.mangowc_process.kill()
-                    except:
-                        pass
             
             # Turn off keyboard lights
             try:
